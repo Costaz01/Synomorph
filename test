@@ -1,0 +1,991 @@
+# %% [code] {"execution":{"iopub.status.busy":"2026-02-06T15:48:57.799631Z","iopub.execute_input":"2026-02-06T15:48:57.799996Z","iopub.status.idle":"2026-02-06T15:49:53.830709Z","shell.execute_reply.started":"2026-02-06T15:48:57.799969Z","shell.execute_reply":"2026-02-06T15:49:53.829868Z"}}
+# ============================================
+# CELLA 1: SETUP E INSTALLAZIONE (Kaggle T4 x2 safe, VERSIONI COERENTI)
+# ============================================
+import os, sys, warnings
+warnings.filterwarnings("ignore")
+
+os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+
+# (Opzionale) evita che diffusers/peft facciano autodetect aggressivo
+os.environ["HF_HUB_DISABLE_TELEMETRY"] = "1"
+
+# --- PIN STACK COERENTE (fix HybridCache) ---
+# transformers deve includere HybridCache, e peft/diffusers devono essere compatibili
+!pip -q install --upgrade \
+  "transformers==4.46.3" \
+  "peft==0.13.2" \
+  "accelerate==0.34.2" \
+  "safetensors>=0.4.5" \
+  "diffusers==0.31.0"
+
+# Video/Audio stack (MoviePy 1.x + deps stabili)
+!pip -q install --upgrade \
+  "moviepy==1.0.3" \
+  "decorator==4.4.2" \
+  "imageio-ffmpeg>=0.4.9"
+
+# SciPy/audio
+!pip -q install --upgrade "librosa" "scipy" "matplotlib"
+
+# Scene detection
+!pip -q install --upgrade "scenedetect[opencv]"
+
+print("✅ Installazione completata (stack pinned e coerente).")
+
+# IMPORTANTE:
+# Se avevi già importato diffusers/transformers/peft prima di questa cella, riavvia il kernel.
+
+# %% [code] {"execution":{"iopub.status.busy":"2026-02-06T15:49:53.832527Z","iopub.execute_input":"2026-02-06T15:49:53.832842Z","iopub.status.idle":"2026-02-06T15:50:24.033014Z","shell.execute_reply.started":"2026-02-06T15:49:53.832814Z","shell.execute_reply":"2026-02-06T15:50:24.032345Z"}}
+# ============================================
+# CELLA 2: IMPORTS E CONFIGURAZIONE (CLEAN)
+# ============================================
+import os, sys, json, random, math, subprocess
+import numpy as np
+import scipy.ndimage
+import scipy.signal
+import librosa
+
+import torch
+import PIL.Image
+from PIL import Image
+
+import cv2
+import matplotlib.pyplot as plt
+
+import imageio
+from moviepy.editor import VideoFileClip
+
+# Diffusers
+from diffusers import AutoPipelineForImage2Image, EulerDiscreteScheduler, AutoencoderKL
+
+# Fix Pillow legacy alias (MoviePy 1.x)
+if not hasattr(PIL.Image, "ANTIALIAS"):
+    PIL.Image.ANTIALIAS = PIL.Image.LANCZOS
+
+# Riduci oversubscription CPU
+try:
+    cv2.setNumThreads(4)
+except Exception:
+    pass
+
+# -------------------------
+# PATHS (tuoi)
+# -------------------------
+AUDIO_PATH  = "/kaggle/input/mountainnnn-ponte/the moment (EDIT DARK drop)_Master.wav"
+DRUMS_PATH  = AUDIO_PATH
+
+VIDEO1_PATH = "/kaggle/input/tra-i-palazzi/1770392829158882.mp4"
+VIDEO2_PATH = "/kaggle/input/tra-i-palazzi/1770392829158882.mp4"
+
+OUTPUT_DIR  = "/kaggle/working"
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+print("📂 Verifica files:")
+for path in [AUDIO_PATH, DRUMS_PATH, VIDEO1_PATH, VIDEO2_PATH]:
+    exists = "✅" if os.path.exists(path) else "❌"
+    print(f" {exists} {os.path.basename(path)}")
+
+print("\n🖥️ Torch:", torch.__version__)
+print("🧠 CUDA available:", torch.cuda.is_available())
+if torch.cuda.is_available():
+    print("🖥️ GPU count:", torch.cuda.device_count())
+    for i in range(torch.cuda.device_count()):
+        print(f"   - GPU {i}: {torch.cuda.get_device_name(i)}")
+
+torch.backends.cudnn.benchmark = True
+if torch.cuda.is_available():
+    torch.cuda.set_device(0)
+
+# %% [code] {"execution":{"iopub.status.busy":"2026-02-06T15:50:24.033883Z","iopub.execute_input":"2026-02-06T15:50:24.034368Z","iopub.status.idle":"2026-02-06T15:50:48.117210Z","shell.execute_reply.started":"2026-02-06T15:50:24.034343Z","shell.execute_reply":"2026-02-06T15:50:48.116380Z"}}
+# ============================================
+# CELLA 3: CARICA MODELLO AI (RealVisXL Lightning) — PRO GRADE
+# ============================================
+print("🔄 Caricamento modello (RealVisXL V4.0 Lightning)...")
+
+# MODELLO TOP: RealVisXL V4.0 Lightning. 
+# Molto superiore al Turbo base per realismo e coerenza "Veo-like".
+MODEL_ID = "SG161222/RealVisXL_V4.0_Lightning"
+VAE_ID = "madebyollin/sdxl-vae-fp16-fix" # INDISPENSABILE per T4 fp16
+
+DTYPE = torch.float16
+
+# 1. Carichiamo VAE fixato per evitare NaN/Black screen
+vae = AutoencoderKL.from_pretrained(VAE_ID, torch_dtype=DTYPE)
+
+# 2. Pipeline con VAE custom
+pipe = AutoPipelineForImage2Image.from_pretrained(
+    MODEL_ID,
+    vae=vae,
+    torch_dtype=DTYPE,
+    variant="fp16",
+    use_safetensors=True
+).to("cuda:0")
+
+# 3. Scheduler specifico per Lightning (CRUCIALE per la qualità in pochi step)
+# Lightning richiede timestep_spacing="trailing"
+pipe.scheduler = EulerDiscreteScheduler.from_config(
+    pipe.scheduler.config, 
+    timestep_spacing="trailing"
+)
+
+pipe.set_progress_bar_config(disable=True)
+
+# 4. Ottimizzazioni Memoria
+try:
+    pipe.enable_xformers_memory_efficient_attention()
+    print("✅ xFormers attention ON")
+except Exception:
+    # Se xformers fallisce, usiamo slicing standard
+    pipe.enable_attention_slicing()
+    print("✅ attention_slicing ON")
+
+# VAE Tiling: salva la VRAM quando lavoriamo a risoluzioni alte (es. vicino al 4K input)
+try:
+    pipe.enable_vae_tiling()
+    print("✅ VAE Tiling ON (Safe for High-Res)")
+except Exception:
+    pass
+    
+  
+
+# CONFIGURAZIONE LIGHTNING "PRO"
+# Lightning richiede Guidance (CFG) tra 1.0 e 2.0 (non 0 come Turbo!)
+# Steps: 4-6 sono il sweet spot per la massima qualità.
+LIGHTNING_GUIDANCE = 1.5  # Ottimo bilanciamento prompt/immagine
+LIGHTNING_STEPS    = 6    # Qualità superiore a 4, veloce quanto Turbo
+
+print("✅ Modello RealVisXL Lightning caricato!")
+print("   MODEL:", MODEL_ID)
+print("   SCHEDULER: EulerDiscrete (Trailing)")
+print("   Steps:", LIGHTNING_STEPS, "| CFG:", LIGHTNING_GUIDANCE)
+
+# %% [code] {"execution":{"iopub.status.busy":"2026-02-06T15:50:48.118878Z","iopub.execute_input":"2026-02-06T15:50:48.119213Z","iopub.status.idle":"2026-02-06T15:50:48.149153Z","shell.execute_reply.started":"2026-02-06T15:50:48.119188Z","shell.execute_reply":"2026-02-06T15:50:48.148562Z"}}
+# ============================================
+# CELLA 4: FUNZIONI CORE (PRO + SAFE, NO-GRADE)
+# ============================================
+
+from typing import Tuple
+import numpy as np
+import cv2
+import scipy.ndimage
+import librosa
+from moviepy.editor import VideoFileClip
+from PIL import Image
+import torch
+
+def fix_rotation(clip: VideoFileClip) -> VideoFileClip:
+    """Gestione rotazione metadata iPhone."""
+    rot = getattr(clip, "rotation", 0) or 0
+    rot = int(rot) % 360
+    if rot != 0:
+        clip = clip.rotate(rot)
+        try:
+            clip.rotation = 0
+        except Exception:
+            pass
+    return clip
+
+# -------------------------
+# TECH: noise estimation (RGB)
+# -------------------------
+def estimate_noise_level_rgb(img_rgb: np.ndarray) -> float:
+    """
+    Stima rapida del 'noise floor' in low-light.
+    Ritorna ~0..1 (non assoluto fisico, ma stabile per auto-tuning).
+    """
+    g = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2GRAY)
+    g = g.astype(np.float32) / 255.0
+    # High-frequency energy via Laplacian
+    lap = cv2.Laplacian(g, cv2.CV_32F, ksize=3)
+    hf = float(np.mean(np.abs(lap)))
+    # Shadow weight (più rumore nelle ombre)
+    shadow = float(np.mean(np.clip((0.35 - g) / 0.35, 0.0, 1.0)))
+    # Combine
+    n = hf * (0.65 + 0.85 * shadow)
+    # Normalize to a practical range
+    n = float(np.clip(n / 0.12, 0.0, 1.0))
+    return n
+
+def apply_smart_denoise_rgb(img_rgb: np.ndarray, base_strength: float = 0.28, max_strength: float = 0.50):
+    """
+    Denoise tecnico "safe" per low-light.
+    - NON cambia grading/contrasto: riduce solo rumore.
+    - Auto-adatta la forza in base al noise stimato.
+    """
+    img = img_rgb
+    noise = estimate_noise_level_rgb(img)
+
+    # forza effettiva (0..1)
+    strength = float(np.clip(base_strength + (max_strength - base_strength) * noise, 0.0, 1.0))
+    if strength <= 1e-4:
+        return img_rgb, {"noise": noise, "strength": 0.0}
+
+    # Parametri NLM: moderati per evitare plasticizzazione
+    h  = int(2 + strength * 6)   # 2..8
+    hc = int(2 + strength * 7)   # 2..9
+
+    den = cv2.fastNlMeansDenoisingColored(img, None, h, hc, 7, 21)
+
+    # Micro anti-wax: recupero micro-dettaglio SOLO se il denoise è stato forte
+    # (unsharp molto leggero, non è "grade", è compensazione tecnica)
+    if strength > 0.38:
+        blur = cv2.GaussianBlur(den, (0, 0), 1.0)
+        den = cv2.addWeighted(den, 1.08, blur, -0.08, 0)
+
+    return den, {"noise": noise, "strength": strength}
+
+# -------------------------
+# TECH: luminance match (RGB, robust)
+# -------------------------
+def match_luminance_ai_to_base_rgb(ai_rgb: np.ndarray, base_rgb: np.ndarray, amount: float = 0.90) -> np.ndarray:
+    """
+    Match luminanza (LAB L) robusto: evita che l'AI scurisca/illumini in modo incoerente.
+    amount 0..1
+    """
+    amount = float(np.clip(amount, 0.0, 1.0))
+    if amount <= 1e-4:
+        return ai_rgb
+
+    ai_lab = cv2.cvtColor(ai_rgb, cv2.COLOR_RGB2LAB).astype(np.float32)
+    bs_lab = cv2.cvtColor(base_rgb, cv2.COLOR_RGB2LAB).astype(np.float32)
+
+    L_ai = ai_lab[..., 0]
+    L_bs = bs_lab[..., 0]
+
+    # robust match con mediana + IQR
+    med_ai = np.median(L_ai)
+    med_bs = np.median(L_bs)
+
+    q1_ai, q3_ai = np.percentile(L_ai, [25, 75])
+    q1_bs, q3_bs = np.percentile(L_bs, [25, 75])
+    iqr_ai = max(1.0, (q3_ai - q1_ai))
+    iqr_bs = max(1.0, (q3_bs - q1_bs))
+
+    L_m = (L_ai - med_ai) * (iqr_bs / iqr_ai) + med_bs
+    L_new = (1.0 - amount) * L_ai + amount * L_m
+
+    ai_lab[..., 0] = np.clip(L_new, 0, 255)
+    out = cv2.cvtColor(ai_lab.astype(np.uint8), cv2.COLOR_LAB2RGB)
+    return out
+
+def stabilize_ai_flicker_rgb(ai_rgb: np.ndarray, prev_ai_rgb: np.ndarray, alpha: float = 0.22) -> np.ndarray:
+    """
+    Anti-flicker leggero SOLO per l'AI (non tocca il base).
+    alpha: 0..1 (più alto = più smoothing temporale).
+    """
+    if prev_ai_rgb is None:
+        return ai_rgb
+    a = float(np.clip(alpha, 0.0, 1.0))
+    if a <= 1e-4:
+        return ai_rgb
+    return cv2.addWeighted(ai_rgb, 1.0 - a, prev_ai_rgb, a, 0)
+
+# -------------------------
+# Scene detection
+# -------------------------
+def detect_scenes(video_path: str, threshold: float = 27.0, min_scene_len_frames: int = 15):
+    """PySceneDetect con fallback robusto."""
+    try:
+        from scenedetect import open_video, SceneManager
+        from scenedetect.detectors import ContentDetector
+
+        video = open_video(video_path)
+        sm = SceneManager()
+        sm.add_detector(ContentDetector(threshold=threshold, min_scene_len=min_scene_len_frames))
+        sm.detect_scenes(video=video, show_progress=False)
+
+        scenes = [(s.get_seconds(), e.get_seconds()) for s, e in sm.get_scene_list()]
+        if not scenes:
+            tmp = fix_rotation(VideoFileClip(video_path))
+            scenes = [(0.0, float(tmp.duration))]
+            tmp.close()
+        return scenes
+
+    except Exception as e:
+        print(f"⚠️ Scene detection error: {e}")
+        tmp = fix_rotation(VideoFileClip(video_path))
+        dur = float(tmp.duration)
+        tmp.close()
+        return [(0.0, dur)]
+
+# -------------------------
+# Audio analysis / cuts (immutato, ok)
+# -------------------------
+def analyze_audio(file_path: str, start: float, duration: float, fps: int):
+    y, sr = librosa.load(file_path, sr=None, offset=float(start), duration=float(duration))
+    hop_length = max(1, int(sr / fps))
+    n_fft = 2048
+
+    if len(y) < n_fft:
+        y = np.pad(y, (0, n_fft - len(y)))
+
+    D = np.abs(librosa.stft(y, n_fft=n_fft, hop_length=hop_length))
+    freqs = librosa.fft_frequencies(sr=sr, n_fft=n_fft)
+
+    def _band_env(f_lo, f_hi=None):
+        mask = (freqs >= f_lo) if f_hi is None else ((freqs >= f_lo) & (freqs < f_hi))
+        if not np.any(mask):
+            return np.zeros(D.shape[1], dtype=np.float32)
+        env = np.mean(D[mask, :], axis=0).astype(np.float32)
+        env = scipy.ndimage.gaussian_filter1d(env, sigma=1.0)
+        env = env / (np.max(env) + 1e-8)
+        return env
+
+    bands = {
+        "low":  _band_env(20, 200),
+        "mid":  _band_env(200, 5000),
+        "high": _band_env(5000, None),
+    }
+
+    onset_env = librosa.onset.onset_strength(y=y, sr=sr, hop_length=hop_length).astype(np.float32)
+    if onset_env.size > 0:
+        onset_env = onset_env / (np.max(onset_env) + 1e-8)
+
+    return {
+        "y": y,
+        "sr": sr,
+        "duration": float(len(y) / sr),
+        "bands": bands,
+        "onset_env": onset_env,
+    }
+
+def generate_cuts(y, sr, onset_env, fps: int, min_dur: float = 0.4, max_dur: float = 2.8):
+    duration = float(len(y) / sr)
+    if duration <= 0:
+        return [0.0, 0.0]
+    if onset_env is None or len(onset_env) == 0:
+        return [0.0, duration]
+
+    hop_length = max(1, int(sr / fps))
+    onsets_t = librosa.onset.onset_detect(
+        onset_envelope=onset_env,
+        sr=sr,
+        hop_length=hop_length,
+        units="time",
+        backtrack=True,
+    )
+
+    if onsets_t is None or len(onsets_t) == 0:
+        return [0.0, duration]
+
+    cuts = [0.0]
+    for t in onsets_t:
+        t = float(t)
+        if t <= 0.0 or t >= duration:
+            continue
+        while (t - cuts[-1]) > max_dur:
+            nxt = cuts[-1] + max_dur
+            if nxt >= duration:
+                break
+            cuts.append(float(nxt))
+        if (t - cuts[-1]) >= min_dur:
+            cuts.append(t)
+
+    while (duration - cuts[-1]) > max_dur:
+        cuts.append(float(cuts[-1] + max_dur))
+
+    if duration - cuts[-1] > 0.08:
+        cuts.append(duration)
+    else:
+        cuts[-1] = duration
+
+    cleaned = []
+    prev = -1e9
+    for c in cuts:
+        c = max(0.0, min(duration, float(c)))
+        if c > prev + 1e-6:
+            cleaned.append(c)
+            prev = c
+
+    if cleaned and cleaned[0] != 0.0:
+        cleaned = [0.0] + cleaned
+    if cleaned and cleaned[-1] != duration:
+        cleaned[-1] = duration
+    return cleaned
+
+NEG_PROMPT_REAL = (
+    "people, faces, portraits, bodies,close up, subject modification, text, UI, logos, watermark"
+)
+
+def apply_ai_img2img(
+    frame_rgb: np.ndarray,
+    prompt: str,
+    strength: float,
+    seed: int,
+    steps: int,
+    guidance: float,
+    negative_prompt: str = NEG_PROMPT_REAL
+):
+    """Wrapper AI (RealVisXL Lightning)"""
+    global pipe
+
+    steps = int(max(4, min(10, steps)))
+    strength = float(max(0.35, min(0.85, strength)))
+
+    init_image = Image.fromarray(frame_rgb.astype(np.uint8)).convert("RGB")
+    g = torch.Generator(device="cuda:0").manual_seed(int(seed))
+
+    try:
+        with torch.inference_mode():
+            with torch.autocast("cuda", dtype=torch.float16):
+                out = pipe(
+                    prompt=prompt,
+                    negative_prompt=negative_prompt,
+                    image=init_image,
+                    strength=strength,
+                    guidance_scale=float(guidance),
+                    num_inference_steps=steps,
+                    generator=g
+                ).images[0]
+        return np.array(out, dtype=np.uint8)
+    except Exception as e:
+        print(f"❌ AI Error: {e}")
+        return frame_rgb
+
+print("✅ Core caricato: NO-GRADE base, denoise tecnico + AI burst smart match")
+
+# %% [code] {"execution":{"iopub.status.busy":"2026-02-06T15:50:48.150009Z","iopub.execute_input":"2026-02-06T15:50:48.150246Z","iopub.status.idle":"2026-02-06T16:23:01.653623Z","shell.execute_reply.started":"2026-02-06T15:50:48.150223Z","shell.execute_reply":"2026-02-06T16:23:01.652800Z"}}
+# ============================================
+# CELLA 5: GENERA VIDEO (NO CROP) + BURSTS FULLSCREEN (SMART MATCH)
+# ============================================
+
+import os, random, subprocess, imageio
+import numpy as np
+import scipy.ndimage
+import matplotlib.pyplot as plt
+from scipy.signal import find_peaks
+
+import torch
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
+torch.backends.cudnn.benchmark = True
+try:
+    torch.set_float32_matmul_precision("high")
+except Exception:
+    pass
+
+# -------------------------
+# PARAMETRI BASE
+# -------------------------
+TRIM_START = 0.0
+TRIM_END   = 20.0
+FPS        = 24
+
+# Base frame policy:
+# - NO grading statico
+# - SOLO denoise tecnico auto-adattivo
+BASE_DENOISE_BASE = 0.26
+BASE_DENOISE_MAX  = 0.52
+
+# -------------------------
+# AI BURST
+# -------------------------
+AI_ENABLED = True
+AI_STEPS    = LIGHTNING_STEPS
+AI_GUIDANCE = LIGHTNING_GUIDANCE
+
+AI_KEYFRAME_STRIDE = 2
+AI_FADE_FRAMES = 3
+
+AI_STRENGTH_MIN = 0.55
+AI_STRENGTH_MAX = 0.75
+
+AI_BURST_LEN_MIN = 10
+AI_BURST_LEN_MAX = 18
+
+TARGET_BURSTS = 10
+MIN_SEP_SEC   = 1.1
+
+# SMART match controls (AI only)
+AI_LUMA_MATCH_AMOUNT = 0.90
+AI_FLICKER_SMOOTH    = 0.22   # 0..1
+
+# -------------------------
+# PROMPT BANK
+# -------------------------
+PROMPT_BASE = (
+    "real camera pictures, night exterior, cold desaturated grading, almost black and white, "
+    "subject barely visible and untouched, environment replaced by vast empty post-industrial landscape, "
+    "cinematic realism, deep shadows, low motion"
+)
+PROMPT_VARIANTS = [
+  "distant industrial fires on horizon, orange glow far away, smoke columns rising slowly, abandoned factories, empty roads, no movement",
+  "huge empty concrete spaces, massive cold halls, sterile and silent, lights far above, subject tiny, echoing emptiness",
+  "small pale moon very far in sky, cold sky gradient, thin clouds, surveillance-like light, no stars",
+  "dark industrial landscape, rusted metal, reflective puddles",
+  "empty field at night, low horizon, heavy shadows",
+  "frozen city edges, inactive lights, abandoned infrastructure, no wind, no people, time suspended",
+]
+
+# -------------------------
+# 0) PROBE DURATE + CLAMP
+# -------------------------
+try:
+    audio_total = float(librosa.get_duration(path=AUDIO_PATH))
+except TypeError:
+    audio_total = float(librosa.get_duration(filename=AUDIO_PATH))
+
+tmp1 = fix_rotation(VideoFileClip(VIDEO1_PATH)).without_audio()
+tmp2 = fix_rotation(VideoFileClip(VIDEO2_PATH)).without_audio()
+vmin = float(min(tmp1.duration, tmp2.duration))
+
+safe_end = min(float(TRIM_END), audio_total, vmin)
+if safe_end <= TRIM_START + 0.5:
+    raise ValueError(f"TRIM range non valido: start={TRIM_START}, end={safe_end}")
+
+TARGET_DURATION = safe_end - float(TRIM_START)
+TRIM_END = float(safe_end)
+
+print("=" * 70)
+print("🎬 GENERAZIONE VIDEO VERTICALE (RealVisXL Lightning) — NO-GRADE BASE")
+print("=" * 70)
+print(f"⏱️ TRIM: {TRIM_START:.2f} → {TRIM_END:.2f}  (dur={TARGET_DURATION:.2f}s) @ {FPS}fps")
+print(f"🤖 AI: {'ON' if AI_ENABLED else 'OFF'} | steps={AI_STEPS} | CFG={AI_GUIDANCE}")
+print("=" * 70)
+
+# -------------------------
+# 1) ANALISI AUDIO
+# -------------------------
+audio = analyze_audio(DRUMS_PATH, start=TRIM_START, duration=TARGET_DURATION, fps=FPS)
+bands = audio["bands"]
+onset_env = audio["onset_env"]
+
+total_frames = int(round(TARGET_DURATION * FPS))
+
+def _fit_len(x, n):
+    x = np.asarray(x, dtype=np.float32)
+    if len(x) == n: return x
+    if len(x) > n: return x[:n]
+    if len(x) == 0: return np.zeros(n, dtype=np.float32)
+    return np.pad(x, (0, n - len(x)), mode="edge")
+
+low_env  = _fit_len(bands["low"],  total_frames)
+mid_env  = _fit_len(bands["mid"],  total_frames)
+high_env = _fit_len(bands["high"], total_frames)
+on_env   = _fit_len(onset_env,     total_frames)
+
+# debug plot (ok)
+t_axis = np.linspace(0, TARGET_DURATION, total_frames)
+plt.figure(figsize=(15, 3))
+plt.plot(t_axis, low_env, label="low")
+plt.plot(t_axis, on_env, label="onset", alpha=0.8)
+plt.title("Audio Analysis")
+plt.legend()
+plt.tight_layout()
+plt.show()
+
+# -------------------------
+# 2) CUTS
+# -------------------------
+cuts = generate_cuts(audio["y"], audio["sr"], onset_env, fps=FPS, min_dur=0.4, max_dur=2.8)
+cuts = [c for c in cuts if 0.0 <= c <= TARGET_DURATION]
+if len(cuts) == 0 or cuts[0] != 0.0: cuts = [0.0] + cuts
+if cuts[-1] != TARGET_DURATION: cuts.append(TARGET_DURATION)
+print(f"\n✂️ CUTS: {len(cuts)}")
+
+# -------------------------
+# 3) CARICA VIDEO
+# -------------------------
+clips = [(VIDEO1_PATH, tmp1), (VIDEO2_PATH, tmp2)]
+
+OUTPUT_W, OUTPUT_H = 1080, 1920
+OUTPUT_W = (OUTPUT_W // 8) * 8
+OUTPUT_H = (OUTPUT_H // 8) * 8
+TARGET_W, TARGET_H = OUTPUT_W, OUTPUT_H
+print(f"✅ Output Target: {TARGET_W}x{TARGET_H}")
+
+video_sources = []
+for vp, clip in clips:
+    scenes = detect_scenes(vp, threshold=27.0, min_scene_len_frames=15)
+    for i, (s_start, s_end) in enumerate(scenes):
+        video_sources.append({
+            "clip": clip,
+            "scene_start": float(s_start),
+            "scene_end": float(s_end),
+            "scene_duration": float(s_end - s_start),
+            "source_path": vp,
+            "scene_idx": i,
+            "usage_count": 0
+        })
+
+assert len(video_sources) > 0, "Nessuna scena disponibile."
+
+# -------------------------
+# 4) MONTAGGIO
+# -------------------------
+segments = []
+random.seed(42)
+
+for i in range(len(cuts) - 1):
+    seg_start = float(cuts[i])
+    seg_end   = float(cuts[i + 1])
+    seg_dur   = float(seg_end - seg_start)
+
+    min_usage = min(s["usage_count"] for s in video_sources)
+    candidates = [s for s in video_sources if s["usage_count"] == min_usage]
+    valid = [s for s in candidates if s["scene_duration"] >= seg_dur * 0.65]
+    if not valid: valid = candidates
+
+    selected_src = random.choice(valid)
+    selected_src["usage_count"] += 1
+
+    avail = max(0.0, selected_src["scene_duration"] - seg_dur)
+    offset = random.uniform(0.0, avail) if avail > 0 else 0.0
+
+    segments.append({
+        "seg_start": seg_start,
+        "seg_end": seg_end,
+        "seg_duration": seg_dur,
+        "source": selected_src,
+        "clip_start": float(selected_src["scene_start"] + offset),
+    })
+
+# -------------------------
+# 5) AI BURSTS (FULLSCREEN)
+# -------------------------
+MIN_SEP_FR = int(MIN_SEP_SEC * FPS)
+score = (0.70 * on_env + 0.30 * low_env).astype(np.float32)
+score = scipy.ndimage.gaussian_filter1d(score, sigma=1.0)
+
+peaks = []
+for q, dist in [(0.70, MIN_SEP_FR), (0.60, int(0.9 * FPS)), (0.50, int(0.7 * FPS))]:
+    thr = float(np.quantile(score, q))
+    p, _ = find_peaks(score, height=thr, distance=dist)
+    if len(p) >= TARGET_BURSTS:
+        peaks = list(map(int, p))
+        break
+if len(peaks) == 0:
+    peaks = list(np.argsort(score)[::-1][:TARGET_BURSTS])
+
+peaks_sorted = sorted(peaks, key=lambda i: float(score[i]), reverse=True)
+selected_peaks = []
+for p in peaks_sorted:
+    if all(abs(p - s) >= MIN_SEP_FR for s in selected_peaks):
+        selected_peaks.append(p)
+    if len(selected_peaks) >= TARGET_BURSTS:
+        break
+selected_peaks = sorted(selected_peaks[:TARGET_BURSTS])
+
+smin, smax = float(score.min()), float(score.max())
+den = (smax - smin) if (smax - smin) > 1e-8 else 1.0
+
+ai_bursts = []
+for start in selected_peaks:
+    sn = (float(score[start]) - smin) / den
+    burst_len = int(np.interp(sn, [0.0, 1.0], [AI_BURST_LEN_MIN, AI_BURST_LEN_MAX]))
+    end = min(int(start) + burst_len, total_frames)
+
+    strength = AI_STRENGTH_MIN + (AI_STRENGTH_MAX - AI_STRENGTH_MIN) * sn
+    strength = float(np.clip(strength, AI_STRENGTH_MIN, AI_STRENGTH_MAX))
+
+    mood = 0
+    if float(low_env[start]) > float(np.quantile(low_env, 0.85)):
+        mood = 1
+    elif float(high_env[start]) > float(np.quantile(high_env, 0.85)):
+        mood = 2
+
+    prompt = PROMPT_VARIANTS[mood % len(PROMPT_VARIANTS)]
+    seed = random.randint(0, 2**31 - 1)
+    ai_bursts.append({"start": int(start), "end": int(end), "strength": strength, "prompt": prompt, "seed": seed})
+
+ai_frame_info = {}
+for bidx, b in enumerate(ai_bursts):
+    for f in range(b["start"], b["end"]):
+        if f >= total_frames: break
+
+        fade = 1.0
+        a = f - b["start"]
+        z = (b["end"] - 1) - f
+        if AI_FADE_FRAMES > 0:
+            if a < AI_FADE_FRAMES:
+                fade = (a + 1) / AI_FADE_FRAMES
+            elif z < AI_FADE_FRAMES:
+                fade = (z + 1) / AI_FADE_FRAMES
+
+        ai_frame_info[int(f)] = {"burst_idx": int(bidx), "fade": float(fade)}
+
+print(f"\n🤖 Bursts creati: {len(ai_bursts)}")
+
+# -------------------------
+# 6) RENDER STREAMING
+# -------------------------
+AI_INTERNAL_W = 768
+AI_INTERNAL_H = 1344
+
+temp_video  = f"{OUTPUT_DIR}/_temp_noaudio.mp4"
+final_video = f"{OUTPUT_DIR}/output_pro_lightning.mp4"
+
+print(f"\n🎨 RENDER START: Output {TARGET_W}x{TARGET_H} | AI Internal {AI_INTERNAL_W}x{AI_INTERNAL_H}")
+
+writer = imageio.get_writer(
+    temp_video,
+    fps=FPS,
+    codec="libx264",
+    ffmpeg_params=["-pix_fmt", "yuv420p", "-preset", "fast", "-crf", "19"]
+)
+
+seg_i = 0
+current_burst = -1
+last_ai_full = None
+prev_ai_for_flicker = None
+
+# log throttling
+last_log = {"noise": 0.0, "strength": 0.0}
+
+for fidx in range(total_frames):
+    t = fidx / FPS
+    while seg_i < (len(segments) - 1) and t >= segments[seg_i]["seg_end"]:
+        seg_i += 1
+
+    seg = segments[seg_i]
+    src = seg["source"]
+
+    src_t = seg["clip_start"] + (t - seg["seg_start"])
+    src_t = max(src["scene_start"], min(src_t, src["scene_end"] - 0.05))
+
+    try:
+        fr = src["clip"].get_frame(src_t)  # RGB
+    except Exception:
+        fr = src["clip"].get_frame(src["scene_start"])
+
+    if fr.shape[0] != TARGET_H or fr.shape[1] != TARGET_W:
+        fr = cv2.resize(fr, (TARGET_W, TARGET_H), interpolation=cv2.INTER_AREA)
+
+    # -------------------------
+    # BASE: SOLO denoise tecnico (auto)
+    # -------------------------
+    fr, dbg = apply_smart_denoise_rgb(fr, base_strength=BASE_DENOISE_BASE, max_strength=BASE_DENOISE_MAX)
+
+    # log ogni tanto (solo se cambia molto)
+    if (fidx % 72 == 0) and (abs(dbg["noise"] - last_log["noise"]) > 0.10):
+        last_log = dbg
+        print(f"   [base denoise] frame={fidx} noise≈{dbg['noise']:.2f} strength≈{dbg['strength']:.2f}")
+
+    # -------------------------
+    # AI Injection (FULLSCREEN)
+    # -------------------------
+    if AI_ENABLED and fidx in ai_frame_info:
+        info = ai_frame_info[fidx]
+        bidx = info["burst_idx"]
+        fade = info["fade"]
+
+        if bidx != current_burst:
+            current_burst = bidx
+            last_ai_full = None
+            prev_ai_for_flicker = None
+            print(f"   ⚡ Burst {bidx+1}/{len(ai_bursts)} | {ai_bursts[bidx]['prompt']}")
+
+        do_keyframe = ((fidx - ai_bursts[bidx]["start"]) % AI_KEYFRAME_STRIDE == 0)
+
+        if do_keyframe:
+            fr_small = cv2.resize(fr, (AI_INTERNAL_W, AI_INTERNAL_H), interpolation=cv2.INTER_AREA)
+            prompt = f"{PROMPT_BASE}, {ai_bursts[bidx]['prompt']}"
+
+            fr_ai_small = apply_ai_img2img(
+                frame_rgb=fr_small,
+                prompt=prompt,
+                strength=ai_bursts[bidx]["strength"],
+                seed=ai_bursts[bidx]["seed"] + fidx,
+                steps=AI_STEPS,
+                guidance=AI_GUIDANCE
+            )
+
+            fr_ai_full = cv2.resize(fr_ai_small, (TARGET_W, TARGET_H), interpolation=cv2.INTER_LANCZOS4)
+
+            # SMART MATCH: luminanza robusta (AI -> base)
+            fr_ai_full = match_luminance_ai_to_base_rgb(fr_ai_full, fr, amount=AI_LUMA_MATCH_AMOUNT)
+
+            # anti-flicker leggero SOLO su AI
+            fr_ai_full = stabilize_ai_flicker_rgb(fr_ai_full, prev_ai_for_flicker, alpha=AI_FLICKER_SMOOTH)
+            prev_ai_for_flicker = fr_ai_full.copy()
+
+            last_ai_full = fr_ai_full
+        else:
+            fr_ai_full = last_ai_full
+
+        if fr_ai_full is not None:
+            fr = cv2.addWeighted(fr, 1.0 - fade, fr_ai_full, fade, 0)
+
+    writer.append_data(fr)
+
+    if fidx % 48 == 0:
+        print(f"   Frame {fidx}/{total_frames}", end="\r")
+
+writer.close()
+print("\n✅ Video raw salvato:", temp_video)
+
+# -------------------------
+# 7) MUX AUDIO
+# -------------------------
+print("🔊 Muxing Audio...")
+cmd = [
+    "ffmpeg", "-y",
+    "-i", temp_video,
+    "-ss", str(TRIM_START), "-t", str(TARGET_DURATION),
+    "-i", AUDIO_PATH,
+    "-map", "0:v:0", "-map", "1:a:0",
+    "-c:v", "copy",
+    "-c:a", "aac", "-b:a", "320k",
+    "-shortest", final_video
+]
+subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+print(f"✅✅✅ RISULTATO FINALE: {final_video}")
+
+try:
+    tmp1.close()
+    tmp2.close()
+except Exception:
+    pass
+
+# %% [code] {"execution":{"iopub.status.busy":"2026-02-06T16:23:01.654928Z","iopub.execute_input":"2026-02-06T16:23:01.655208Z","iopub.status.idle":"2026-02-06T16:25:15.811657Z","shell.execute_reply.started":"2026-02-06T16:23:01.655168Z","shell.execute_reply":"2026-02-06T16:25:15.810955Z"}}
+# ============================================
+# CELLA 6: POST (OPTIONAL UPSCALE + HQ ENCODE, SAFE)
+# ============================================
+
+import os, subprocess
+
+IN_VIDEO = f"{OUTPUT_DIR}/output_pro_lightning.mp4"
+
+# Se vuoi restare 1080x1920 -> lascia False.
+# Se vuoi 2160x3840 (4K verticale) -> True (20s è fattibile).
+UPSCALE_TO_4K = True
+
+# Output
+OUT_VIDEO = f"{OUTPUT_DIR}/output_pro_lightning_final.mp4"
+
+def ffprobe_wh(path):
+    cmd = ["ffprobe","-v","error","-select_streams","v:0","-show_entries","stream=width,height",
+           "-of","csv=s=x:p=0", path]
+    r = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    if r.returncode != 0 or "x" not in r.stdout:
+        return None
+    w,h = r.stdout.strip().split("x")
+    return int(w), int(h)
+
+wh = ffprobe_wh(IN_VIDEO)
+print("📐 Input video:", wh, IN_VIDEO)
+
+if UPSCALE_TO_4K:
+    target_w, target_h = 2160, 3840
+else:
+    target_w, target_h = wh if wh else (1080, 1920)
+
+# Encode HQ: niente “grading”, solo resa tecnica migliore (bitrate/CRF/preset)
+# Lanczos upscale + slight unsharp SOLO se upscali (compensazione tecnica).
+vf = f"scale={target_w}:{target_h}:flags=lanczos"
+if UPSCALE_TO_4K:
+    vf = vf + ",unsharp=5:5:0.35:3:3:0.0"
+
+cmd = [
+    "ffmpeg", "-y",
+    "-i", IN_VIDEO,
+    "-vf", vf,
+    "-c:v", "libx264",
+    "-preset", "slow",
+    "-crf", "18",
+    "-pix_fmt", "yuv420p",
+    "-c:a", "copy",
+    OUT_VIDEO
+]
+print("🚀 Encoding:", " ".join(cmd[:10]), " ...")
+subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+print("✅ Final:", OUT_VIDEO)
+
+# %% [code] {"execution":{"iopub.status.busy":"2026-02-06T16:25:15.812609Z","iopub.execute_input":"2026-02-06T16:25:15.812821Z","iopub.status.idle":"2026-02-06T16:26:31.278311Z","shell.execute_reply.started":"2026-02-06T16:25:15.812800Z","shell.execute_reply":"2026-02-06T16:26:31.277462Z"}}
+# ============================================
+# CELLA 6: VIDEO MASTERING & FINISHING (The "Compressor")
+# ============================================
+import subprocess
+import os
+
+# Definiamo i percorsi
+INPUT_VIDEO = "/kaggle/working/output_pro_lightning.mp4" # Il risultato della cella 5
+MASTER_VIDEO = "/kaggle/working/FINAL_MASTERED_VEO_STYLE.mp4"
+
+print("🎛️ AVVIO MASTERING SUITE 2026")
+print(f"   Input: {INPUT_VIDEO}")
+
+# ---------------------------------------------------------
+# SPIEGAZIONE DELLA CATENA DI FILTRI ("THE SECRET SAUCE")
+# ---------------------------------------------------------
+# 1. hqdn3d (High Quality 3D Denoise):
+#    Funziona come un "noise gate" intelligente. Analizza i frame precedenti e successivi.
+#    Pulisce il "formicolio" digitale tipico di SDXL nelle zone scure.
+#
+# 2. Unsharp Mask (luma_sharpen):
+#    Non è un semplice sharpen. Aumenta il contrasto locale sui bordi (acutanza).
+#    Rende l'immagine "croccante" (Crisp) come se fosse 8K downscalato.
+#
+# 3. Color Eq & Curves (Il "Compressore"):
+#    - Contrasto +1.1 (Spinge i neri giù e i bianchi su)
+#    - Saturazione 0.9 (Desaturazione elegante, stile sci-fi/Veo)
+#    - Gamma 0.95 (Scurisce i mezzitoni per dare peso/gravità all'immagine)
+# ---------------------------------------------------------
+
+# Parametri Mastering
+DENOISE_STRENGTH = 4.0   # Da 0 a 10. 4.0 è aggressivo ma mantiene i dettagli.
+SHARPEN_AMOUNT   = 1.2   # Da 0 a 2.0. 1.2 è "Ultra Defined".
+CONTRAST         = 1.08  # Leggero boost
+SATURATION       = 0.85  # Look desaturato/lunare
+GAMMA            = 0.92  # Crush dei neri (nasconde i difetti nelle ombre)
+
+# Costruiamo il filtro complesso FFmpeg
+# Sintassi: [input] filtro1, filtro2, filtro3 [output]
+filters = (
+    f"hqdn3d={DENOISE_STRENGTH}:{DENOISE_STRENGTH}:6:6,"  # Spatial/Temporal Denoise
+    f"unsharp=5:5:{SHARPEN_AMOUNT}:5:5:0.0,"              # Luma Sharpening (solo luminosità)
+    f"eq=contrast={CONTRAST}:saturation={SATURATION}:gamma={GAMMA}," # Color Grade
+    # Aggiungiamo una vignettatura finale per focus centrale
+    f"vignette=PI/4" 
+)
+
+print(f"   ⚡ Applicazione filtri:\n   Denoise -> Sharpen -> Grade -> Vignette")
+
+cmd_master = [
+    "ffmpeg", "-y",
+    "-i", INPUT_VIDEO,
+    "-c:v", "libx264",      # Codec H.264 robusto
+    "-preset", "slow",      # Preset lento = Massima compressione/qualità
+    "-crf", "17",           # Qualità visivamente lossless (quasi ProRes)
+    "-vf", filters,         # La nostra catena magica
+    "-c:a", "copy",         # Copia l'audio senza toccarlo (è già masterizzato)
+    MASTER_VIDEO
+]
+
+try:
+    process = subprocess.Popen(
+        cmd_master, 
+        stdout=subprocess.PIPE, 
+        stderr=subprocess.STDOUT, 
+        universal_newlines=True
+    )
+    
+    # Leggiamo il log in tempo reale per non annoiarci
+    print("\n   Rendering in corso (FFmpeg High-End)...")
+    for line in process.stdout:
+        # Stampiamo solo le righe di progress (contengono "time=")
+        if "time=" in line:
+            print(f"   Processing: {line.strip()}", end="\r")
+            
+    process.wait()
+    
+    if process.returncode == 0:
+        print(f"\n\n✅ MASTERING COMPLETATO!")
+        print(f"   📁 File salvato: {MASTER_VIDEO}")
+        print("   Questo file ha: Rumore ridotto, Dettagli 'pop', Neri cinematografici.")
+    else:
+        print("\n❌ Errore durante il mastering.")
+        
+except Exception as e:
+    print(f"❌ Errore critico: {e}")
+
+# ============================================
+# OPTIONAL: CHECK DEL RISULTATO (Confronto dimensioni)
+# ============================================
+size_in = os.path.getsize(INPUT_VIDEO) / (1024*1024)
+size_out = os.path.getsize(MASTER_VIDEO) / (1024*1024)
+print(f"\n📊 Dati Tecnici:")
+print(f"   Originale: {size_in:.2f} MB")
+print(f"   Mastered:  {size_out:.2f} MB (Bitrate ottimizzato)")
